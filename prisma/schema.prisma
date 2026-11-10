@@ -1,0 +1,211 @@
+// KNOOVIQ Workforce Attendance — data models (spec §7)
+// SQLite + Prisma. Enum-like fields are strings validated with Zod on the server.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  // Neon pooler (PgBouncer) sits in front of `url`; schema push / migrations
+  // go through the direct endpoint instead (prepared-statement safe).
+  directUrl = env("DIRECT_DATABASE_URL")
+}
+
+model User {
+  id                 String    @id @default(cuid())
+  employeeId         String    @unique
+  name               String
+  email              String    @unique
+  passwordHash       String
+  role               String    @default("EMPLOYEE") // EMPLOYEE | MANAGER | HR_ADMIN
+  department         String    @default("General")
+  managerId          String?
+  officeId           String?
+  shiftId            String?
+  isActive           Boolean   @default(true)
+  mustChangePassword Boolean   @default(false)
+  failedLoginCount   Int       @default(0)
+  lockUntil          DateTime?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  manager       User?          @relation("ManagerLinks", fields: [managerId], references: [id], onDelete: SetNull)
+  reports       User[]         @relation("ManagerLinks")
+  office        Office?        @relation(fields: [officeId], references: [id], onDelete: SetNull)
+  shift         Shift?         @relation(fields: [shiftId], references: [id], onDelete: SetNull)
+  sessions      Session[]
+  attendances   Attendance[]
+  leaveRequests LeaveRequest[] @relation("RequestOwner")
+  approvedReqs  LeaveRequest[]        @relation("ApproverLinks")
+  leaveBalances LeaveBalance[]
+  statusNote    StatusNote?
+  notifications Notification[]
+  auditLogs     AuditLog[]
+}
+
+model Session {
+  id               String    @id @default(cuid())
+  userId           String
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshTokenHash String
+  userAgent        String    @default("")
+  ip               String    @default("")
+  expiresAt        DateTime
+  revokedAt        DateTime?
+  createdAt        DateTime  @default(now())
+
+  @@index([userId])
+  @@index([refreshTokenHash])
+}
+
+model Office {
+  id           String @id @default(cuid())
+  name         String
+  lat          Float
+  lng          Float
+  radiusMeters Int    @default(25)
+  timezone     String @default("Asia/Kolkata")
+  // Comma-separated public IP addresses / IPv4 CIDR ranges of the office network.
+  // When non-empty, employees connecting from these IPs can punch attendance
+  // even when device GPS is unavailable or outside the geofence (network
+  // presence acts as the office-zone proof). Empty = GPS-only punching.
+  allowedIps   String @default("")
+  users        User[]
+  holidays     Holiday[]
+}
+
+model Shift {
+  id              String @id @default(cuid())
+  name            String
+  startTime       String // "09:00"
+  endTime         String // "18:00"
+  graceMinutes    Int    @default(15)
+  fullDayMinutes  Int    @default(480)
+  halfDayMinutes  Int    @default(240)
+  users           User[]
+}
+
+model Attendance {
+  id               String    @id @default(cuid())
+  userId           String
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  date             String // YYYY-MM-DD (IST office date)
+  checkInAt        DateTime?
+  checkInLat       Float?
+  checkInLng       Float?
+  checkInAccuracy  Float?
+  checkInDistance  Float?
+  checkInMode      String? // OFFICE | WFH | OUTSIDE
+  checkOutAt       DateTime?
+  checkOutLat      Float?
+  checkOutLng      Float?
+  checkOutAccuracy Float?
+  checkOutDistance Float?
+  checkOutMode     String?
+  workMinutes      Int       @default(0)
+  breakMinutes     Int       @default(0)
+  status           String    @default("NOT_CHECKED_IN") // PRESENT | HALF_DAY | ABSENT | LATE | ON_LEAVE | WFH | OUTSIDE | HOLIDAY | WEEKLY_OFF | NOT_CHECKED_IN
+  flagged          Boolean   @default(false)
+  flagReason       String?
+  autoClosed       Boolean   @default(false)
+  breaks           BreakRecord[]
+
+  @@unique([userId, date])
+  @@index([date])
+}
+
+model BreakRecord {
+  id           String     @id @default(cuid())
+  attendanceId String
+  attendance   Attendance @relation(fields: [attendanceId], references: [id], onDelete: Cascade)
+  start        DateTime
+  end          DateTime?
+  minutes      Int        @default(0)
+
+  @@index([attendanceId])
+}
+
+model LeaveBalance {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  year   Int
+  type   String // CASUAL_LEAVE | SICK_LEAVE | EARNED_LEAVE | WFH
+  quota  Float
+  used   Float  @default(0)
+
+  @@unique([userId, year, type])
+}
+
+model LeaveRequest {
+  id             String    @id @default(cuid())
+  userId         String
+  user           User      @relation("RequestOwner", fields: [userId], references: [id], onDelete: Cascade)
+  type           String // CASUAL_LEAVE | SICK_LEAVE | EARNED_LEAVE | WFH | OFFICIAL_WORK_OUTSIDE | REGULARIZATION
+  fromDate       String // YYYY-MM-DD
+  toDate         String // YYYY-MM-DD
+  halfDay        Boolean   @default(false)
+  reason         String
+  status         String    @default("PENDING") // PENDING | APPROVED | REJECTED | CANCELLED
+  approverId     String?
+  approver       User?     @relation("ApproverLinks", fields: [approverId], references: [id], onDelete: SetNull)
+  managerComment String?
+  daysCount      Float     @default(0)
+  regDate        String? // REGULARIZATION only
+  regInTime      String? // "HH:mm"
+  regOutTime     String? // "HH:mm"
+  createdAt      DateTime  @default(now())
+  decidedAt      DateTime?
+
+  @@index([userId])
+  @@index([status])
+  @@index([fromDate, toDate])
+}
+
+model Holiday {
+  id       String  @id @default(cuid())
+  date     String // YYYY-MM-DD
+  name     String
+  officeId String?
+  office   Office? @relation(fields: [officeId], references: [id], onDelete: SetNull)
+
+  @@unique([date, officeId])
+}
+
+model StatusNote {
+  id               String    @id @default(cuid())
+  userId           String    @unique
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  status           String    @default("NOT_CHECKED_IN") // WORKING_IN_OFFICE | ON_BREAK | IN_MEETING | CLIENT_VISIT | WFH | OUT_OF_OFFICE | ON_LEAVE | NOT_CHECKED_IN
+  note             String    @default("")
+  expectedReturnAt DateTime?
+  updatedAt        DateTime  @updatedAt
+}
+
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      String // REQUEST_SUBMITTED | REQUEST_DECIDED | FLAGGED_PUNCH | AUTO_CLOSED | SYSTEM
+  message   String
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+model AuditLog {
+  id        String    @id @default(cuid())
+  actorId   String?
+  actor     User?     @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  action    String
+  entity    String
+  entityId  String
+  before    String?
+  after     String?
+  createdAt DateTime  @default(now())
+
+  @@index([createdAt])
+}
